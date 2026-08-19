@@ -54,7 +54,7 @@ Image, ImageEnhance, ImageFilter, np = ensure_deps()
 
 
 def degrade(img: Image.Image) -> Image.Image:
-    quality, noise, blur, scale, passes = 45, 0.03, 0.75, 0.72, 3
+    quality, noise, blur, scale, passes = 45, 0.02, 0.75, 0.72, 3
     vignette = 0.12
 
     def jpeg_recompress(im, q):
