@@ -4,9 +4,12 @@ Menu interativo em Python para trabalhar com ZIPs: testar senha numérica (CPU o
 
 ## O que faz
 
-1. **Adivinhar Senha** — força bruta numérica (ex.: 4, 6 ou 8 dígitos)
-   - **CPU** — Python puro (sempre funciona, mais lento)
-   - **GPU** — Hashcat + placa de vídeo (muito mais rápido; ex.: RTX 4090)
+1. **Adivinhar Senha** — força bruta numérica em **ZIP ou RAR**
+   - **CPU** — Python + 7-Zip/WinRAR (sempre funciona, mais lento)
+   - **GPU** — Hashcat + placa de vídeo (muito mais rápido)
+     - ZIP AES → Hashcat `-m 13600`
+     - RAR5 → `-m 13000` (precisa [rar2john](https://www.openwall.com/john/) / John the Ripper)
+     - RAR3 → `-m 12500` / `23800`
 2. **Extrair Arquivos** — extrai `.zip`, `.rar`, `.7z` e outros de uma pasta (com ou sem senha)
 3. **Criar Vários Zips** — zipa cada subpasta com a mesma senha (AES-256)
 4. **Renumerar Arquivos** — em cada subpasta, renomeia arquivos para `1`, `2`, `3`… (mantém a extensão)
@@ -18,7 +21,9 @@ Menu interativo em Python para trabalhar com ZIPs: testar senha numérica (CPU o
 - **Python 3** instalado ([python.org](https://python.org)) — marque *"Add Python to PATH"* na instalação
 - Dependências instaladas automaticamente na primeira execução: `pyzipper`, `rarfile`, `py7zr`
 - Para `.rar`: **WinRAR** ou **7-Zip** instalado ajuda (o script detecta sozinho)
-- Para **GPU** (opção 1): [Hashcat](https://hashcat.net/hashcat/) instalado + driver NVIDIA/AMD com OpenCL/CUDA
+- Para **GPU** (opção 1): [Hashcat](https://hashcat.net/hashcat/) + driver NVIDIA/AMD
+- Para **GPU com RAR**: também o [John the Ripper](https://www.openwall.com/john/) (`rar2john.exe`)
+- Para **CPU com RAR**: 7-Zip ou WinRAR (o script detecta sozinho)
 
 ## Como usar
 
@@ -35,7 +40,7 @@ python zip.py
 
 | Opção | O que informar |
 |-------|----------------|
-| 1 | Caminho do `.zip` + quantos dígitos + **CPU ou GPU** |
+| 1 | Caminho do `.zip`/`.rar` + quantos dígitos + **CPU ou GPU** |
 | 2 | Pasta com arquivos compactados + se têm senha |
 | 3 | Pasta com subpastas + senha (aparece `*`; pede confirmação) |
 | 4 | Pasta com subpastas (cada uma é numerada do zero) |

@@ -4,7 +4,7 @@ Ferramentas ZIP — menu interativo.
 
 Uso: python zip.py
 
-  1. Adivinhar Senha      — força bruta numérica (CPU ou GPU/Hashcat)
+  1. Adivinhar Senha      — força bruta numérica ZIP/RAR (CPU ou GPU/Hashcat)
   2. Extrair Arquivos     — extrai .zip, .rar, .7z e outros da pasta
   3. Criar Vários Zips    — zipa cada subpasta com senha AES
   4. Renumerar Arquivos   — numera arquivos em cada subpasta (1, 2, 3…)
@@ -123,9 +123,17 @@ def pedir_tamanho_gb() -> float:
             continue
         return gb
 
-def pedir_caminho_arquivo(extensao: str = ".zip") -> Path:
+def pedir_caminho_arquivo(
+    extensao: str | tuple[str, ...] = ".zip",
+) -> Path:
+    if isinstance(extensao, str):
+        extensoes = (extensao.lower(),)
+    else:
+        extensoes = tuple(e.lower() for e in extensao)
+    lista = ", ".join(extensoes)
+
     while True:
-        caminho = input(f"Caminho do arquivo {extensao}: ").strip().strip('"')
+        caminho = input(f"Caminho do arquivo ({lista}): ").strip().strip('"')
         if not caminho:
             log("AVISO", "Informe um caminho válido.")
             continue
@@ -133,8 +141,8 @@ def pedir_caminho_arquivo(extensao: str = ".zip") -> Path:
         if not arquivo.is_file():
             log("ERRO", f"Arquivo não encontrado: {arquivo}")
             continue
-        if arquivo.suffix.lower() != extensao:
-            log("ERRO", f"O arquivo precisa ter extensão {extensao}")
+        if arquivo.suffix.lower() not in extensoes:
+            log("ERRO", f"O arquivo precisa ser: {lista}")
             continue
         return arquivo
 
@@ -262,11 +270,13 @@ def pedir_motor() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Utilitários ZIP
+# Utilitários ZIP / RAR
 # ---------------------------------------------------------------------------
 
+EXTENSOES_ADIVINHAR = (".zip", ".zipx", ".rar", ".cbr")
 
-def senha_funciona(arquivo: Path, senha: str) -> bool:
+
+def senha_funciona_zip(arquivo: Path, senha: str) -> bool:
     try:
         with pyzipper.AESZipFile(arquivo, "r") as zf:
             zf.pwd = senha.encode("utf-8")
@@ -276,6 +286,40 @@ def senha_funciona(arquivo: Path, senha: str) -> bool:
                     return True
     except (RuntimeError, Exception):
         return False
+    return False
+
+
+def senha_funciona_rar(arquivo: Path, senha: str) -> bool:
+    """Testa senha RAR via 7-Zip (preferencial) ou UnRAR."""
+    seven = achar_7z()
+    if seven is not None:
+        resultado = subprocess.run(
+            [str(seven), "t", f"-p{senha}", "-y", str(arquivo)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return resultado.returncode == 0
+
+    unrar = achar_unrar()
+    if unrar is None:
+        return False
+    try:
+        rarfile.UNRAR_TOOL = str(unrar)
+        with rarfile.RarFile(arquivo) as rf:
+            rf.testrar(pwd=senha)
+        return True
+    except Exception:
+        return False
+
+
+def senha_funciona(arquivo: Path, senha: str) -> bool:
+    ext = arquivo.suffix.lower()
+    if ext in {".zip", ".zipx", ".cbz"}:
+        return senha_funciona_zip(arquivo, senha)
+    if ext in {".rar", ".cbr"}:
+        return senha_funciona_rar(arquivo, senha)
     return False
 
 
@@ -296,8 +340,11 @@ def estimar_tempo(total: int, por_segundo: float = TENTATIVAS_POR_SEGUNDO) -> st
 # Hashcat / GPU
 # ---------------------------------------------------------------------------
 
-# Velocidade típica WinZip AES (modo 13600) numa RTX 4090 — ordem de grandeza
-TENTATIVAS_GPU_POR_SEGUNDO = 80_000
+# Velocidade típica (ordem de grandeza numa RTX 4090)
+TENTATIVAS_GPU_ZIP_AES = 80_000   # modo 13600
+TENTATIVAS_GPU_RAR5 = 8_000       # modo 13000 (bem mais lento)
+TENTATIVAS_GPU_RAR3 = 150_000     # modo 12500
+TENTATIVAS_GPU_POR_SEGUNDO = TENTATIVAS_GPU_ZIP_AES  # default
 
 
 def achar_hashcat() -> Path | None:
@@ -444,6 +491,142 @@ def extrair_hash_zip2_aes(arquivo: Path) -> tuple[str, int]:
     return melhores[0][1], 13600
 
 
+def achar_rar2john() -> Path | None:
+    """Procura rar2john (John the Ripper) no PATH e pastas comuns."""
+    for nome in ("rar2john", "rar2john.exe"):
+        p = shutil.which(nome)
+        if p:
+            return Path(p)
+
+    candidatos: list[Path] = []
+    for base in (
+        Path.home(),
+        Path("C:/"),
+        Path("D:/"),
+        Path("C:/Tools"),
+        Path("C:/JohnTheRipper"),
+        Path("C:/john"),
+        Path("D:/john"),
+        Path.home() / "Desktop",
+        Path.home() / "Downloads",
+    ):
+        if not base.exists():
+            continue
+        for pasta_nome in ("john*", "John*", "JtR*", "run"):
+            try:
+                for pasta in base.glob(pasta_nome):
+                    if pasta.is_dir():
+                        candidatos.append(pasta / "rar2john.exe")
+                        candidatos.append(pasta / "run" / "rar2john.exe")
+            except OSError:
+                pass
+        candidatos.append(base / "rar2john.exe")
+        candidatos.append(base / "run" / "rar2john.exe")
+
+    for c in candidatos:
+        if c.is_file():
+            return c
+    return None
+
+
+def _limpar_hash_rar2john(linha: str) -> str:
+    """
+    rar2john costuma emitir: arquivo.rar:$rar5$...:arquivo.rar
+    Hashcat quer só: $rar5$...
+    """
+    linha = linha.strip()
+    if not linha or linha.startswith("ver:") or ":" not in linha:
+        return ""
+
+    # Pega a partir do primeiro $...
+    if "$" in linha:
+        parte = linha[linha.index("$"):]
+    else:
+        return ""
+
+    # Remove sufixo :nome_arquivo se existir depois do hash
+    # hashes rar5/rar3 não têm ':' no meio do hash em si (usam $)
+    # mas rar2john acrescenta :arquivo no final
+    if parte.count(":") >= 1:
+        # Ex.: $rar5$16$...$8$abcd:arquivo.rar
+        # Mantém só até antes do último :se parecer nome de arquivo
+        ultimo = parte.rfind(":")
+        cauda = parte[ultimo + 1:]
+        if cauda and (cauda.endswith((".rar", ".cbr", ".RAR")) or "\\" in cauda or "/" in cauda):
+            parte = parte[:ultimo]
+
+    return parte.strip()
+
+
+def modo_hashcat_rar(hash_str: str) -> tuple[int, float]:
+    """Retorna (modo_hashcat, tentativas/s estimadas)."""
+    h = hash_str
+    hl = hash_str.lower()
+    if hl.startswith("$rar5$"):
+        return 13000, float(TENTATIVAS_GPU_RAR5)
+    if h.startswith("$RAR3$*0*") or hl.startswith("$rar3$*0*"):
+        return 12500, float(TENTATIVAS_GPU_RAR3)
+    if h.startswith("$RAR3$*1*") or hl.startswith("$rar3$*1*"):
+        # RAR3 com dados embutidos — tenta comprimido primeiro
+        return 23800, float(TENTATIVAS_GPU_RAR3) / 5
+    raise ValueError(f"Formato de hash RAR não suportado: {hash_str[:60]}…")
+
+
+def extrair_hash_rar(arquivo: Path) -> tuple[str, int, float]:
+    """
+    Extrai hash RAR via rar2john.
+    Retorna (hash, modo_hashcat, velocidade_estimada).
+    """
+    rar2john = achar_rar2john()
+    if rar2john is None:
+        raise ValueError(
+            "Para GPU com RAR é preciso o rar2john (John the Ripper jumbo).\n"
+            "  Baixe: https://www.openwall.com/john/  ou use a opção CPU "
+            "(funciona com 7-Zip/WinRAR instalado)."
+        )
+
+    resultado = subprocess.run(
+        [str(rar2john), str(arquivo)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    saida = (resultado.stdout or "") + "\n" + (resultado.stderr or "")
+    hash_str = ""
+    for linha in saida.splitlines():
+        limpo = _limpar_hash_rar2john(linha)
+        if limpo.startswith("$rar5$") or limpo.startswith("$RAR3$") or limpo.startswith("$rar3$"):
+            hash_str = limpo
+            break
+        if limpo.startswith("$"):
+            hash_str = limpo
+            break
+
+    if not hash_str:
+        raise ValueError(
+            "rar2john não retornou um hash válido. "
+            "O arquivo pode não ter senha ou estar corrompido."
+        )
+
+    modo, vel = modo_hashcat_rar(hash_str)
+    return hash_str, modo, vel
+
+
+def extrair_hash_arquivo(arquivo: Path) -> tuple[str, int, float]:
+    """
+    Extrai hash para Hashcat conforme o tipo do arquivo.
+    Retorna (hash, modo, tentativas_por_segundo_estimadas).
+    """
+    ext = arquivo.suffix.lower()
+    if ext in {".zip", ".zipx", ".cbz"}:
+        h, modo = extrair_hash_zip2_aes(arquivo)
+        return h, modo, float(TENTATIVAS_GPU_ZIP_AES)
+    if ext in {".rar", ".cbr"}:
+        return extrair_hash_rar(arquivo)
+    raise ValueError(f"Extensão não suportada na GPU: {ext}")
+
+
 def adivinhar_cpu(arquivo: Path, digitos: int) -> None:
     total = 10**digitos
     senha_min = "0" * digitos
@@ -508,16 +691,12 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
 
     log("INFO", f"Motor: GPU (Hashcat)")
     log("INFO", f"Arquivo: {arquivo.name}")
+    log("INFO", f"Tipo: {arquivo.suffix.lower()}")
     log("INFO", f"Dígitos: {digitos}  |  Máscara: {mascara}")
     log("INFO", f"Combinações: {total:,}")
-    log(
-        "INFO",
-        f"Tempo estimado RTX 4090 (ordem de grandeza): "
-        f"{estimar_tempo(total, TENTATIVAS_GPU_POR_SEGUNDO)}",
-    )
 
     try:
-        hash_str, modo = extrair_hash_zip2_aes(arquivo)
+        hash_str, modo, vel_est = extrair_hash_arquivo(arquivo)
     except ValueError as exc:
         log("ERRO", str(exc))
         if pedir_sim_nao("Tentar com CPU em vez disso?"):
@@ -525,6 +704,13 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
         return
 
     log("OK", f"Hash extraído (modo Hashcat {modo})")
+    log(
+        "INFO",
+        f"Tempo estimado RTX 4090 (ordem de grandeza): "
+        f"{estimar_tempo(total, vel_est)}",
+    )
+    if modo == 13000:
+        log("INFO", "RAR5 é bem mais lento que ZIP AES — 8 dígitos pode levar minutos.")
     log("INFO", "Iniciando Hashcat — acompanhe o progresso na saída abaixo…")
     log_linha()
 
@@ -619,8 +805,8 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
             log("INFO", "Se aparecer erro de OpenCL/CUDA, confira o driver NVIDIA na VM.")
             log(
                 "INFO",
-                "Se 'Token length exception', use um ZIP de teste pequeno "
-                "(poucos KB) criado na opção 3, ou use a opção CPU.",
+                "Se 'Token length exception', use um arquivo de teste pequeno "
+                "ou a opção CPU.",
             )
 
     log_linha()
@@ -628,12 +814,20 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
 
 def opcao_adivinhar() -> None:
     log_linha()
-    log("INFO", "Modo: Adivinhar Senha (força bruta numérica)")
+    log("INFO", "Modo: Adivinhar Senha (força bruta numérica — ZIP ou RAR)")
     log_linha()
 
-    arquivo = pedir_caminho_arquivo()
+    arquivo = pedir_caminho_arquivo(EXTENSOES_ADIVINHAR)
     digitos = pedir_quantidade_digitos()
     motor = pedir_motor()
+
+    if arquivo.suffix.lower() in {".rar", ".cbr"}:
+        if achar_7z() is None and achar_unrar() is None:
+            log(
+                "AVISO",
+                "Para RAR na CPU é preciso 7-Zip ou WinRAR instalado. "
+                "Na GPU, rar2john (John the Ripper).",
+            )
 
     if motor == "gpu":
         adivinhar_gpu(arquivo, digitos)
