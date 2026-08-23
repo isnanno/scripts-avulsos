@@ -41,7 +41,7 @@ scripts-avulsos/
 | Script | Descrição |
 |--------|-----------|
 | [foto-realista](foto-realista/) | Deixa fotos geradas por IA com aparência mais realista (compressão, ruído, etc.) |
-| [ferramentas-zip](ferramentas-zip/) | Menu ZIP: adivinhar senha, extrair, criar com AES, renumerar e dividir em partes por GB |
+| [ferramentas-zip](ferramentas-zip/) | Menu ZIP/RAR: adivinhar senha (CPU ou GPU), extrair, criar AES, renumerar e dividir por GB |
 
 ## Requisitos gerais
 
