@@ -258,8 +258,8 @@ def pedir_motor() -> str:
     """Retorna 'cpu' ou 'gpu'."""
     print()
     print("  Como quer tentar adivinhar?")
-    print("  1. CPU  — Python puro (funciona sempre, mais lento)")
-    print("  2. GPU  — Hashcat + placa de vídeo (muito mais rápido)")
+    print("  1. CPU  — Python / 7-Zip (funciona sempre, mais lento)")
+    print("  2. GPU  — Hashcat (ZIP) ou John (RAR) + placa de vídeo")
     while True:
         escolha = input("Escolha (1-2): ").strip()
         if escolha == "1":
@@ -680,7 +680,183 @@ def adivinhar_cpu(arquivo: Path, digitos: int) -> None:
     log_linha()
 
 
-def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
+def achar_john() -> Path | None:
+    """Procura john.exe (junto do rar2john, em geral em .../run/)."""
+    for nome in ("john", "john.exe"):
+        p = shutil.which(nome)
+        if p:
+            return Path(p)
+
+    rar2 = achar_rar2john()
+    if rar2 is not None:
+        cand = rar2.parent / "john.exe"
+        if cand.is_file():
+            return cand
+
+    for base in (Path("C:/john"), Path("D:/john"), Path("C:/JohnTheRipper"), Path.home() / "john"):
+        for cand in (base / "run" / "john.exe", base / "john.exe"):
+            if cand.is_file():
+                return cand
+    return None
+
+
+def pedir_caminho_john() -> Path | None:
+    encontrado = achar_john()
+    if encontrado:
+        log("OK", f"John the Ripper encontrado: {encontrado}")
+        return encontrado
+    log("AVISO", "john.exe não encontrado.")
+    log("INFO", "Baixe o pacote Windows em: https://github.com/openwall/john-packages/releases")
+    log("INFO", "Extraia em C:\\john  (precisa existir C:\\john\\run\\john.exe e rar2john.exe)")
+    caminho = input("Caminho do john.exe (ou Enter para cancelar): ").strip().strip('"')
+    if not caminho:
+        return None
+    exe = Path(caminho)
+    if exe.is_dir():
+        exe = exe / "john.exe"
+    if not exe.is_file():
+        log("ERRO", f"Arquivo não encontrado: {exe}")
+        return None
+    return exe
+
+
+def adivinhar_gpu_rar_john(arquivo: Path, digitos: int) -> None:
+    """RAR na GPU via John the Ripper (RAR5-opencl / rar-opencl)."""
+    john = pedir_caminho_john()
+    if john is None:
+        log("AVISO", "Sem John, não dá para usar GPU em RAR.")
+        if pedir_sim_nao("Tentar com CPU em vez disso?"):
+            adivinhar_cpu(arquivo, digitos)
+        return
+
+    rar2john = achar_rar2john()
+    if rar2john is None:
+        # tenta na mesma pasta do john
+        cand = john.parent / "rar2john.exe"
+        if cand.is_file():
+            rar2john = cand
+    if rar2john is None:
+        log("ERRO", "rar2john.exe não encontrado (deve estar em C:\\john\\run\\).")
+        return
+
+    total = 10**digitos
+    mascara = "?d" * digitos
+    log("INFO", "Motor: GPU (John the Ripper OpenCL) — melhor que Hashcat para RAR nesta VM")
+    log("INFO", f"Arquivo: {arquivo.name}")
+    log("INFO", f"Dígitos: {digitos}  |  Máscara: {mascara}")
+    log("INFO", f"Combinações: {total:,}")
+
+    # Extrai hash no formato john (com prefixo do arquivo)
+    resultado = subprocess.run(
+        [str(rar2john), str(arquivo)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    linhas = [
+        ln.strip()
+        for ln in ((resultado.stdout or "") + "\n" + (resultado.stderr or "")).splitlines()
+        if "$rar5$" in ln.lower() or "$rar3$" in ln.lower() or "$RAR3$" in ln
+    ]
+    if not linhas:
+        log("ERRO", "rar2john não gerou hash. O RAR tem senha?")
+        return
+
+    # Detecta formato
+    amostra = linhas[0].lower()
+    if "$rar5$" in amostra:
+        fmt = "RAR5-opencl"
+        vel = float(TENTATIVAS_GPU_RAR5)
+    else:
+        fmt = "rar-opencl"
+        vel = float(TENTATIVAS_GPU_RAR3)
+
+    log("OK", f"Hash RAR extraído → formato John {fmt}")
+    log("INFO", f"Tempo estimado GPU (ordem de grandeza): {estimar_tempo(total, vel)}")
+    log("INFO", "Iniciando John na GPU…")
+    log_linha()
+
+    with tempfile.TemporaryDirectory(prefix="rar_john_") as tmp:
+        pasta = Path(tmp)
+        hash_file = pasta / "hash.txt"
+        # Uma linha basta (mesmo salt/check costuma se repetir)
+        hash_file.write_text(linhas[0] + "\n", encoding="utf-8")
+
+        # potfile dedicado nesta pasta (não polui o john.pot global)
+        pot = pasta / "john.pot"
+        # LWS/GWS fixos evitam crash no auto-tune em alguns drivers NVIDIA
+        cmd = [
+            str(john),
+            f"--format={fmt}",
+            f"--mask={mascara}",
+            "--lws=64",
+            "--gws=16384",
+            f"--pot={pot}",
+            "--verbosity=1",
+            str(hash_file),
+        ]
+
+        inicio = time.perf_counter()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(john.parent),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except KeyboardInterrupt:
+            print()
+            log("AVISO", "John interrompido.")
+            return
+
+        duracao = time.perf_counter() - inicio
+        log_linha()
+
+        senha = None
+        if pot.is_file():
+            for linha in pot.read_text(encoding="utf-8", errors="replace").splitlines():
+                if ":" in linha:
+                    senha = linha.rsplit(":", 1)[-1].strip()
+
+        if not senha:
+            show = subprocess.run(
+                [str(john), "--show", f"--pot={pot}", f"--format={fmt}", str(hash_file)],
+                cwd=str(john.parent),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            for linha in (show.stdout or "").splitlines():
+                # arquivo:senha   ou  ?:senha
+                if ":" in linha and not linha.strip().startswith("0 password"):
+                    partes = linha.strip().split(":")
+                    if len(partes) >= 2 and partes[-1].strip().isdigit():
+                        senha = partes[-1].strip()
+                        break
+                    if len(partes) >= 2 and partes[-1].strip():
+                        # senha pode não ser só dígitos se o usuário errar dígitos
+                        candidato = partes[-1].strip()
+                        if candidato and "password" not in candidato.lower():
+                            senha = candidato
+                            break
+
+        if senha:
+            log("OK", f"A senha é {senha}")
+            log("INFO", f"Encontrada em {duracao:.2f}s via GPU (John)")
+        else:
+            log("AVISO", f"Nenhuma senha encontrada entre {'0' * digitos} e {'9' * digitos}")
+            log("INFO", f"Tempo: {duracao:.2f}s (código John: {proc.returncode})")
+            if proc.returncode not in (0, 1):
+                log("INFO", "Se falhar de novo, atualize o driver NVIDIA ou use CPU.")
+
+    log_linha()
+
+
+def adivinhar_gpu_zip_hashcat(arquivo: Path, digitos: int) -> None:
+    """ZIP na GPU via Hashcat (modo 13600), forçando OpenCL se CUDA falhar (PTX)."""
     hashcat = pedir_caminho_hashcat()
     if hashcat is None:
         log("AVISO", "GPU cancelada. Use a opção CPU ou instale o Hashcat.")
@@ -689,14 +865,14 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
     total = 10**digitos
     mascara = "?d" * digitos
 
-    log("INFO", f"Motor: GPU (Hashcat)")
+    log("INFO", "Motor: GPU (Hashcat)")
     log("INFO", f"Arquivo: {arquivo.name}")
-    log("INFO", f"Tipo: {arquivo.suffix.lower()}")
     log("INFO", f"Dígitos: {digitos}  |  Máscara: {mascara}")
     log("INFO", f"Combinações: {total:,}")
 
     try:
-        hash_str, modo, vel_est = extrair_hash_arquivo(arquivo)
+        hash_str, modo = extrair_hash_zip2_aes(arquivo)
+        vel_est = float(TENTATIVAS_GPU_ZIP_AES)
     except ValueError as exc:
         log("ERRO", str(exc))
         if pedir_sim_nao("Tentar com CPU em vez disso?"):
@@ -704,14 +880,8 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
         return
 
     log("OK", f"Hash extraído (modo Hashcat {modo})")
-    log(
-        "INFO",
-        f"Tempo estimado RTX 4090 (ordem de grandeza): "
-        f"{estimar_tempo(total, vel_est)}",
-    )
-    if modo == 13000:
-        log("INFO", "RAR5 é bem mais lento que ZIP AES — 8 dígitos pode levar minutos.")
-    log("INFO", "Iniciando Hashcat — acompanhe o progresso na saída abaixo…")
+    log("INFO", f"Tempo estimado RTX 4090: {estimar_tempo(total, vel_est)}")
+    log("INFO", "Iniciando Hashcat (OpenCL primeiro — evita bug PTX do CUDA 13)…")
     log_linha()
 
     with tempfile.TemporaryDirectory(prefix="zip_gpu_") as tmp:
@@ -721,7 +891,7 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
         outfile = pasta / "cracked.txt"
         potfile = pasta / "potfile.txt"
 
-        cmd = [
+        base_cmd = [
             str(hashcat),
             "-m", str(modo),
             "-a", "3",
@@ -734,15 +904,22 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
             str(hash_file),
             mascara,
         ]
-        # -O (optimized) acelera, mas em alguns modos/tamanhos falha — tenta com, depois sem
-        cmds_tentar = [cmd[:4] + ["-O"] + cmd[4:], cmd]
+        # 1) OpenCL (ignora CUDA — corrige PTX 9.3 vs 9.2)
+        # 2) CUDA normal
+        # 3) OpenCL sem -O
+        cmds_tentar = [
+            base_cmd[:4] + ["--backend-ignore-cuda", "-O"] + base_cmd[4:],
+            base_cmd[:4] + ["--backend-ignore-cuda"] + base_cmd[4:],
+            base_cmd[:4] + ["-O"] + base_cmd[4:],
+            base_cmd,
+        ]
 
         inicio = time.perf_counter()
         resultado = None
         try:
             for i, cmd_atual in enumerate(cmds_tentar):
-                if i == 1:
-                    log("AVISO", "Nova tentativa sem kernels -O…")
+                if i > 0:
+                    log("AVISO", f"Tentativa alternativa {i + 1}/{len(cmds_tentar)}…")
                 resultado = subprocess.run(
                     cmd_atual,
                     cwd=str(hashcat.parent),
@@ -750,11 +927,9 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
                     encoding="utf-8",
                     errors="replace",
                 )
-                # 0 = cracked, 1 = exhausted, -1/255 = erro
                 if resultado.returncode in (0, 1):
                     break
-                if i == 0:
-                    log("AVISO", f"Hashcat retornou código {resultado.returncode}")
+                log("AVISO", f"Hashcat retornou código {resultado.returncode}")
         except FileNotFoundError:
             log("ERRO", "Não foi possível executar o Hashcat.")
             return
@@ -798,18 +973,21 @@ def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
             log("INFO", f"Encontrada em {duracao:.2f}s via GPU")
         elif resultado is not None and resultado.returncode in (0, 1):
             log("AVISO", f"Nenhuma senha encontrada entre {'0' * digitos} e {'9' * digitos}")
-            log("INFO", f"Tempo total: {duracao:.2f}s (código Hashcat: {resultado.returncode})")
+            log("INFO", f"Tempo total: {duracao:.2f}s")
         else:
             codigo = resultado.returncode if resultado else "?"
             log("ERRO", f"Hashcat terminou com código {codigo}")
-            log("INFO", "Se aparecer erro de OpenCL/CUDA, confira o driver NVIDIA na VM.")
-            log(
-                "INFO",
-                "Se 'Token length exception', use um arquivo de teste pequeno "
-                "ou a opção CPU.",
-            )
+            log("INFO", "Driver NVIDIA / Hashcat incompatível (PTX). Atualize o driver ou use CPU.")
 
     log_linha()
+
+
+def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
+    ext = arquivo.suffix.lower()
+    if ext in {".rar", ".cbr"}:
+        adivinhar_gpu_rar_john(arquivo, digitos)
+    else:
+        adivinhar_gpu_zip_hashcat(arquivo, digitos)
 
 
 def opcao_adivinhar() -> None:
