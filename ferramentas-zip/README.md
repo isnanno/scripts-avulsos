@@ -1,10 +1,12 @@
 # ferramentas-zip
 
-Menu interativo em Python para trabalhar com ZIPs: testar senha numérica, extrair, criar com AES, renumerar arquivos e dividir um ZIP grande em várias partes.
+Menu interativo em Python para trabalhar com ZIPs: testar senha numérica (CPU ou GPU), extrair, criar com AES, renumerar arquivos e dividir um ZIP grande em várias partes.
 
 ## O que faz
 
-1. **Adivinhar Senha** — força bruta numérica (ex.: 4 ou 8 dígitos) para medir quão fraca é a senha
+1. **Adivinhar Senha** — força bruta numérica (ex.: 4, 6 ou 8 dígitos)
+   - **CPU** — Python puro (sempre funciona, mais lento)
+   - **GPU** — Hashcat + placa de vídeo (muito mais rápido; ex.: RTX 4090)
 2. **Extrair Arquivos** — extrai `.zip`, `.rar`, `.7z` e outros de uma pasta (com ou sem senha)
 3. **Criar Vários Zips** — zipa cada subpasta com a mesma senha (AES-256)
 4. **Renumerar Arquivos** — em cada subpasta, renomeia arquivos para `1`, `2`, `3`… (mantém a extensão)
@@ -16,6 +18,7 @@ Menu interativo em Python para trabalhar com ZIPs: testar senha numérica, extra
 - **Python 3** instalado ([python.org](https://python.org)) — marque *"Add Python to PATH"* na instalação
 - Dependências instaladas automaticamente na primeira execução: `pyzipper`, `rarfile`, `py7zr`
 - Para `.rar`: **WinRAR** ou **7-Zip** instalado ajuda (o script detecta sozinho)
+- Para **GPU** (opção 1): [Hashcat](https://hashcat.net/hashcat/) instalado + driver NVIDIA/AMD com OpenCL/CUDA
 
 ## Como usar
 
@@ -32,11 +35,20 @@ python zip.py
 
 | Opção | O que informar |
 |-------|----------------|
-| 1 | Caminho do `.zip` + quantos dígitos tem a senha |
+| 1 | Caminho do `.zip` + quantos dígitos + **CPU ou GPU** |
 | 2 | Pasta com arquivos compactados + se têm senha |
 | 3 | Pasta com subpastas + senha (aparece `*`; pede confirmação) |
 | 4 | Pasta com subpastas (cada uma é numerada do zero) |
 | 5 | Um `.zip` + senha (se tiver) + tamanho máximo em GB (ex.: `2`) |
+
+### Opção 1 com GPU
+
+1. Escolha `1` → informe o ZIP → digitos (ex.: `6` ou `8`)
+2. Escolha `2` (GPU)
+3. Se o Hashcat não estiver no PATH, cole o caminho do `hashcat.exe`
+4. O script extrai o hash AES e roda o Hashcat com máscara numérica (`?d?d?d…`)
+
+Dica: para testar GPU, crie um ZIP pequeno na opção 3 com senha tipo `123456` — ZIPs enormes podem estourar o limite de tamanho do hash no Hashcat.
 
 ### Opção 5 — saída
 
@@ -56,7 +68,8 @@ na mesma pasta do original. A pasta temporária de extração é apagada no fina
 - Senhas digitadas nas opções 2, 3 e 5 aparecem como `********` (não ficam em branco)
 - Espaço em disco: na opção 5, conte com espaço ≈ tamanho do ZIP + conteúdo extraído
 - Se um único arquivo for maior que o limite em GB, ele vai sozinho em um ZIP (pode passar do limite)
+- GPU usa Hashcat modo `13600` (WinZip AES) — o mesmo formato da opção 3 deste script
 
 ## Erros
 
-Se faltar Python, dependência ou a senha estiver errada, o script mostra um log com horário (`INFO`, `OK`, `AVISO`, `ERRO`). Use `Ctrl+C` para cancelar uma operação em andamento.
+Se faltar Python, dependência, Hashcat ou a senha estiver errada, o script mostra um log com horário (`INFO`, `OK`, `AVISO`, `ERRO`). Use `Ctrl+C` para cancelar uma operação em andamento.

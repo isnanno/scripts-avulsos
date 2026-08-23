@@ -4,7 +4,7 @@ Ferramentas ZIP — menu interativo.
 
 Uso: python zip.py
 
-  1. Adivinhar Senha      — força bruta numérica
+  1. Adivinhar Senha      — força bruta numérica (CPU ou GPU/Hashcat)
   2. Extrair Arquivos     — extrai .zip, .rar, .7z e outros da pasta
   3. Criar Vários Zips    — zipa cada subpasta com senha AES
   4. Renumerar Arquivos   — numera arquivos em cada subpasta (1, 2, 3…)
@@ -13,9 +13,12 @@ Uso: python zip.py
 
 from __future__ import annotations
 
+import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -243,6 +246,21 @@ def pedir_quantidade_digitos() -> int:
         return digitos
 
 
+def pedir_motor() -> str:
+    """Retorna 'cpu' ou 'gpu'."""
+    print()
+    print("  Como quer tentar adivinhar?")
+    print("  1. CPU  — Python puro (funciona sempre, mais lento)")
+    print("  2. GPU  — Hashcat + placa de vídeo (muito mais rápido)")
+    while True:
+        escolha = input("Escolha (1-2): ").strip()
+        if escolha == "1":
+            return "cpu"
+        if escolha == "2":
+            return "gpu"
+        log("AVISO", "Digite 1 ou 2.")
+
+
 # ---------------------------------------------------------------------------
 # Utilitários ZIP
 # ---------------------------------------------------------------------------
@@ -261,8 +279,10 @@ def senha_funciona(arquivo: Path, senha: str) -> bool:
     return False
 
 
-def estimar_tempo(total: int) -> str:
-    segundos = total / TENTATIVAS_POR_SEGUNDO
+def estimar_tempo(total: int, por_segundo: float = TENTATIVAS_POR_SEGUNDO) -> str:
+    if por_segundo <= 0:
+        por_segundo = TENTATIVAS_POR_SEGUNDO
+    segundos = total / por_segundo
     if segundos < 60:
         return f"~{segundos:.0f} segundos"
     if segundos < 3600:
@@ -273,23 +293,164 @@ def estimar_tempo(total: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Opção 1 — Adivinhar Senha
+# Hashcat / GPU
 # ---------------------------------------------------------------------------
 
+# Velocidade típica WinZip AES (modo 13600) numa RTX 4090 — ordem de grandeza
+TENTATIVAS_GPU_POR_SEGUNDO = 80_000
 
-def opcao_adivinhar() -> None:
-    log_linha()
-    log("INFO", "Modo: Adivinhar Senha (força bruta numérica)")
-    log_linha()
 
-    arquivo = pedir_caminho_arquivo()
-    digitos = pedir_quantidade_digitos()
+def achar_hashcat() -> Path | None:
+    """Procura hashcat.exe no PATH e pastas comuns."""
+    no_path = shutil.which("hashcat") or shutil.which("hashcat.exe")
+    if no_path:
+        return Path(no_path)
 
+    candidatos: list[Path] = []
+    for base in (
+        Path.home(),
+        Path("C:/"),
+        Path("D:/"),
+        Path("C:/Tools"),
+        Path("C:/hashcat"),
+        Path("D:/hashcat"),
+        Path.home() / "Desktop",
+        Path.home() / "Downloads",
+    ):
+        if not base.exists():
+            continue
+        candidatos.append(base / "hashcat.exe")
+        candidatos.append(base / "hashcat" / "hashcat.exe")
+        try:
+            for pasta in base.glob("hashcat*"):
+                if pasta.is_dir():
+                    candidatos.append(pasta / "hashcat.exe")
+        except OSError:
+            pass
+
+    for c in candidatos:
+        if c.is_file():
+            return c
+    return None
+
+
+def pedir_caminho_hashcat() -> Path | None:
+    encontrado = achar_hashcat()
+    if encontrado:
+        log("OK", f"Hashcat encontrado: {encontrado}")
+        return encontrado
+
+    log("AVISO", "Hashcat não encontrado no PATH.")
+    log("INFO", "Baixe em https://hashcat.net/hashcat/ e extraia a pasta.")
+    caminho = input("Caminho do hashcat.exe (ou Enter para cancelar): ").strip().strip('"')
+    if not caminho:
+        return None
+    exe = Path(caminho)
+    if exe.is_dir():
+        exe = exe / "hashcat.exe"
+    if not exe.is_file():
+        log("ERRO", f"Arquivo não encontrado: {exe}")
+        return None
+    return exe
+
+
+def extrair_hash_zip2_aes(arquivo: Path) -> tuple[str, int]:
+    """
+    Extrai hash $zip2$ (WinZip AES) para Hashcat modo 13600.
+    Retorna (hash, modo_hashcat).
+    """
+    data = arquivo.read_bytes()
+    AES_EXTRA = 0x9901
+    SALT_LEN = {1: 8, 2: 12, 3: 16}
+    melhores: list[tuple[int, str]] = []
+
+    # Percorre cabeçalhos locais PK\x03\x04
+    pos = 0
+    while True:
+        idx = data.find(b"PK\x03\x04", pos)
+        if idx < 0:
+            break
+        if idx + 30 > len(data):
+            break
+
+        flags, metodo, _mtime, _mdate, _crc, comp_size, _uncomp, nome_len, extra_len = (
+            struct.unpack_from("<HHHHIIIHH", data, idx + 6)
+        )
+        # ZIP64 / data descriptor: sizes may be 0 — still try if AES
+        nome_inicio = idx + 30
+        extra_inicio = nome_inicio + nome_len
+        dados_inicio = extra_inicio + extra_len
+        pos = idx + 4
+
+        if not (flags & 0x0001):
+            continue  # não criptografado
+
+        # AES = compression method 99 + extra field 0x9901
+        aes_strength = None
+        if metodo == 99:
+            extra = data[extra_inicio:extra_inicio + extra_len]
+            off = 0
+            while off + 4 <= len(extra):
+                hid, hsz = struct.unpack_from("<HH", extra, off)
+                off += 4
+                if hid == AES_EXTRA and hsz >= 7:
+                    # ver(2) vendor(2) strength(1) actual_comp(2)
+                    aes_strength = extra[off + 4]
+                    break
+                off += hsz
+
+        if aes_strength not in SALT_LEN:
+            continue
+
+        salt_len = SALT_LEN[aes_strength]
+        # Layout: salt | pwd_verify(2) | ciphertext | auth_code(10)
+        if comp_size == 0xFFFFFFFF or comp_size < salt_len + 2 + 10:
+            # tamanho desconhecido / ZIP64 — tenta via pyzipper info se possível
+            continue
+
+        salt = data[dados_inicio:dados_inicio + salt_len]
+        pwd_verify = data[dados_inicio + salt_len:dados_inicio + salt_len + 2]
+        auth_off = dados_inicio + comp_size - 10
+        auth = data[auth_off:auth_off + 10]
+        payload_len = auth_off - (dados_inicio + salt_len + 2)
+        if payload_len < 0 or len(salt) != salt_len or len(pwd_verify) != 2 or len(auth) != 10:
+            continue
+
+        # Inclui DF só se for pequeno (limite do Hashcat ~8KB)
+        max_df = 4096
+        if payload_len <= max_df:
+            df_hex = data[dados_inicio + salt_len + 2:auth_off].hex()
+            le_hex = f"{payload_len:x}"
+        else:
+            # Sem blob: Hashcat ainda valida pelos 2 bytes de verificação + auth
+            df_hex = ""
+            le_hex = "0"
+
+        hash_str = (
+            f"$zip2$*0*{aes_strength}*0*"
+            f"{salt.hex()}*{pwd_verify.hex()}*"
+            f"{le_hex}*{df_hex}*{auth.hex()}*$/zip2$"
+        )
+        melhores.append((comp_size, hash_str))
+
+    if not melhores:
+        raise ValueError(
+            "Não foi possível extrair hash AES deste ZIP. "
+            "Use um ZIP com senha AES (opção 3 deste script) ou instale zip2john."
+        )
+
+    # Menor entrada = hash mais leve
+    melhores.sort(key=lambda x: x[0])
+    return melhores[0][1], 13600
+
+
+def adivinhar_cpu(arquivo: Path, digitos: int) -> None:
     total = 10**digitos
     senha_min = "0" * digitos
     senha_max = "9" * digitos
     intervalo = max(500, total // 200)
 
+    log("INFO", f"Motor: CPU (Python / 1 núcleo)")
     log("INFO", f"Arquivo: {arquivo.name}")
     log("INFO", f"Dígitos: {digitos}")
     log("INFO", f"Combinações: {total:,} ({senha_min} a {senha_max})")
@@ -334,6 +495,150 @@ def opcao_adivinhar() -> None:
         log("INFO", f"Tempo total: {duracao:.2f}s ({tentativas:,} tentativas)")
 
     log_linha()
+
+
+def adivinhar_gpu(arquivo: Path, digitos: int) -> None:
+    hashcat = pedir_caminho_hashcat()
+    if hashcat is None:
+        log("AVISO", "GPU cancelada. Use a opção CPU ou instale o Hashcat.")
+        return
+
+    total = 10**digitos
+    mascara = "?d" * digitos
+
+    log("INFO", f"Motor: GPU (Hashcat)")
+    log("INFO", f"Arquivo: {arquivo.name}")
+    log("INFO", f"Dígitos: {digitos}  |  Máscara: {mascara}")
+    log("INFO", f"Combinações: {total:,}")
+    log(
+        "INFO",
+        f"Tempo estimado RTX 4090 (ordem de grandeza): "
+        f"{estimar_tempo(total, TENTATIVAS_GPU_POR_SEGUNDO)}",
+    )
+
+    try:
+        hash_str, modo = extrair_hash_zip2_aes(arquivo)
+    except ValueError as exc:
+        log("ERRO", str(exc))
+        if pedir_sim_nao("Tentar com CPU em vez disso?"):
+            adivinhar_cpu(arquivo, digitos)
+        return
+
+    log("OK", f"Hash extraído (modo Hashcat {modo})")
+    log("INFO", "Iniciando Hashcat — acompanhe o progresso na saída abaixo…")
+    log_linha()
+
+    with tempfile.TemporaryDirectory(prefix="zip_gpu_") as tmp:
+        pasta = Path(tmp)
+        hash_file = pasta / "hash.txt"
+        hash_file.write_text(hash_str + "\n", encoding="utf-8")
+        outfile = pasta / "cracked.txt"
+        potfile = pasta / "potfile.txt"
+
+        cmd = [
+            str(hashcat),
+            "-m", str(modo),
+            "-a", "3",
+            "-w", "3",
+            "--status",
+            "--status-timer=5",
+            "--potfile-path", str(potfile),
+            "--outfile", str(outfile),
+            "--outfile-format", "2",
+            str(hash_file),
+            mascara,
+        ]
+        # -O (optimized) acelera, mas em alguns modos/tamanhos falha — tenta com, depois sem
+        cmds_tentar = [cmd[:4] + ["-O"] + cmd[4:], cmd]
+
+        inicio = time.perf_counter()
+        resultado = None
+        try:
+            for i, cmd_atual in enumerate(cmds_tentar):
+                if i == 1:
+                    log("AVISO", "Nova tentativa sem kernels -O…")
+                resultado = subprocess.run(
+                    cmd_atual,
+                    cwd=str(hashcat.parent),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                # 0 = cracked, 1 = exhausted, -1/255 = erro
+                if resultado.returncode in (0, 1):
+                    break
+                if i == 0:
+                    log("AVISO", f"Hashcat retornou código {resultado.returncode}")
+        except FileNotFoundError:
+            log("ERRO", "Não foi possível executar o Hashcat.")
+            return
+        except KeyboardInterrupt:
+            print()
+            log("AVISO", "Hashcat interrompido.")
+            return
+
+        duracao = time.perf_counter() - inicio
+        log_linha()
+
+        senha = None
+        if outfile.is_file() and outfile.stat().st_size > 0:
+            linhas = outfile.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+            senha = linhas[-1].strip() if linhas else None
+
+        if not senha and potfile.is_file():
+            for linha in potfile.read_text(encoding="utf-8", errors="replace").splitlines():
+                if ":" in linha:
+                    senha = linha.rsplit(":", 1)[-1].strip()
+
+        if not senha:
+            show = subprocess.run(
+                [
+                    str(hashcat), "-m", str(modo),
+                    "--potfile-path", str(potfile),
+                    "--show", str(hash_file),
+                ],
+                cwd=str(hashcat.parent),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            for linha in (show.stdout or "").splitlines():
+                if ":" in linha:
+                    senha = linha.rsplit(":", 1)[-1].strip()
+
+        if senha:
+            log("OK", f"A senha é {senha}")
+            log("INFO", f"Encontrada em {duracao:.2f}s via GPU")
+        elif resultado is not None and resultado.returncode in (0, 1):
+            log("AVISO", f"Nenhuma senha encontrada entre {'0' * digitos} e {'9' * digitos}")
+            log("INFO", f"Tempo total: {duracao:.2f}s (código Hashcat: {resultado.returncode})")
+        else:
+            codigo = resultado.returncode if resultado else "?"
+            log("ERRO", f"Hashcat terminou com código {codigo}")
+            log("INFO", "Se aparecer erro de OpenCL/CUDA, confira o driver NVIDIA na VM.")
+            log(
+                "INFO",
+                "Se 'Token length exception', use um ZIP de teste pequeno "
+                "(poucos KB) criado na opção 3, ou use a opção CPU.",
+            )
+
+    log_linha()
+
+
+def opcao_adivinhar() -> None:
+    log_linha()
+    log("INFO", "Modo: Adivinhar Senha (força bruta numérica)")
+    log_linha()
+
+    arquivo = pedir_caminho_arquivo()
+    digitos = pedir_quantidade_digitos()
+    motor = pedir_motor()
+
+    if motor == "gpu":
+        adivinhar_gpu(arquivo, digitos)
+    else:
+        adivinhar_cpu(arquivo, digitos)
 
 
 # ---------------------------------------------------------------------------
