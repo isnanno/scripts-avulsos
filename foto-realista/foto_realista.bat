@@ -127,14 +127,14 @@ def _blob_noise(shape, sigma: float, blob: int) -> np.ndarray:
 
 
 def degrade(img: Image.Image) -> Image.Image:
-    # tunables aimed at WhatsApp phone look (see amostras 1-3)
-    jpeg_pass_q, final_feel_q = 50, 58
-    passes = 3
-    soft_scale = 0.68
-    blur = 0.95
-    vignette = 0.045
-    lum_noise = 0.032
-    chroma_noise = 0.12
+    # Subtle WhatsApp phone look — match amostras (esp. 3): fine grain, not TV static
+    jpeg_pass_q, final_feel_q = 58, 70
+    passes = 2
+    soft_scale = 0.78
+    blur = 0.55
+    vignette = 0.035
+    lum_noise = 0.018
+    chroma_noise = 0.032
 
     result = img.convert("RGB")
 
@@ -144,7 +144,7 @@ def degrade(img: Image.Image) -> Image.Image:
         result = result.resize((tw, th), Image.Resampling.BILINEAR)
 
     # 2) micro tilt (handheld)
-    angle = random.uniform(-0.35, 0.35)
+    angle = random.uniform(-0.28, 0.28)
     if abs(angle) > 0.05:
         tilted = result.rotate(angle, resample=Image.Resampling.BILINEAR, expand=True, fillcolor=(0, 0, 0))
         cw, ch = result.size
@@ -152,66 +152,74 @@ def degrade(img: Image.Image) -> Image.Image:
         top = max((tilted.height - ch) // 2, 0)
         result = tilted.crop((left, top, left + cw, top + ch))
 
-    result = _jpeg_recompress(result, 78)
+    result = _jpeg_recompress(result, 82)
 
     # soft optic: down/up + blur, then cheap ISP sharpen
     w, h = result.size
     small = result.resize((max(int(w * soft_scale), 2), max(int(h * soft_scale), 2)), Image.Resampling.BILINEAR)
     result = small.resize((w, h), Image.Resampling.BILINEAR)
     result = result.filter(ImageFilter.GaussianBlur(radius=blur))
-    result = ImageEnhance.Sharpness(result).enhance(1.12)
+    result = ImageEnhance.Sharpness(result).enhance(1.08)
 
     arr = np.array(result, dtype=np.float32)
 
     # 3) white-balance cast + weak R<->B crosstalk
-    warm = random.uniform(-0.05, 0.07)
+    warm = random.uniform(-0.03, 0.045)
     arr[..., 0] *= 1.0 + warm
-    arr[..., 1] *= 1.0 + warm * 0.25
-    arr[..., 2] *= 1.0 - warm * 0.65
-    rb = random.uniform(0.02, 0.045)
+    arr[..., 1] *= 1.0 + warm * 0.2
+    arr[..., 2] *= 1.0 - warm * 0.55
+    rb = random.uniform(0.012, 0.028)
     r0, b0 = arr[..., 0].copy(), arr[..., 2].copy()
     arr[..., 0] = r0 * (1.0 - rb) + b0 * rb
     arr[..., 2] = b0 * (1.0 - rb) + r0 * rb
 
-    # 4) dirty-lens bloom on highlights
+    # 4) dirty-lens bloom on highlights (gentle)
     gray = np.dot(arr[..., :3], [0.299, 0.587, 0.114])
-    hi = np.clip((gray - 175.0) / 70.0, 0.0, 1.0)[..., None]
+    hi = np.clip((gray - 185.0) / 65.0, 0.0, 1.0)[..., None]
     bloom_img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).filter(
-        ImageFilter.GaussianBlur(radius=random.uniform(4.5, 7.5))
+        ImageFilter.GaussianBlur(radius=random.uniform(3.5, 5.5))
     )
     bloom = np.array(bloom_img, dtype=np.float32)
-    arr = arr + bloom * hi * random.uniform(0.18, 0.32)
+    arr = arr + bloom * hi * random.uniform(0.10, 0.18)
 
-    # 5) YUV noise: luma fine + chroma blobs (stronger in shadows)
+    # 5) YUV noise: mostly fine luma; chroma subtle (avoid RGB static)
     y, u, v = _to_yuv(arr)
+    mean_y = float(np.mean(y))
+    # Dark AI scenes amplify any noise into rainbow static — scale down hard
+    scene = 0.45 if mean_y < 40 else (0.65 if mean_y < 70 else 1.0)
     shadow = np.clip(1.0 - (y / 255.0), 0.0, 1.0)
-    shadow_w = 0.45 + 0.85 * shadow
+    shadow_w = (0.50 + 0.35 * shadow) * scene
     y = y + np.random.normal(0, lum_noise * 255, y.shape).astype(np.float32) * shadow_w
-    # mottling (breaks AI-smooth skin)
-    y = y + _blob_noise(y.shape, lum_noise * 90, blob=random.randint(6, 10)) * (0.35 + 0.4 * shadow)
-    u = u + _blob_noise(u.shape, chroma_noise * 160, blob=random.randint(3, 6)) * (0.85 + 1.25 * shadow)
-    v = v + _blob_noise(v.shape, chroma_noise * 160, blob=random.randint(3, 6)) * (0.85 + 1.25 * shadow)
-    # fine chroma pepper
-    u += np.random.normal(0, chroma_noise * 55, u.shape).astype(np.float32) * shadow_w
-    v += np.random.normal(0, chroma_noise * 55, v.shape).astype(np.float32) * shadow_w
+    # fine mottling (higher blob = smaller grain)
+    y = y + _blob_noise(y.shape, lum_noise * 40 * scene, blob=random.randint(12, 18)) * (0.2 + 0.2 * shadow)
+    u = u + _blob_noise(u.shape, chroma_noise * 40 * scene, blob=random.randint(10, 16)) * (0.35 + 0.4 * shadow)
+    v = v + _blob_noise(v.shape, chroma_noise * 40 * scene, blob=random.randint(10, 16)) * (0.35 + 0.4 * shadow)
+    # light chroma pepper (kept low so it stays grayish, not neon)
+    u += np.random.normal(0, chroma_noise * 12 * scene, u.shape).astype(np.float32) * shadow_w
+    v += np.random.normal(0, chroma_noise * 12 * scene, v.shape).astype(np.float32) * shadow_w
 
     # 6) fake 4:2:0 chroma subsample (mosquito-ish)
     y, u, v = _chroma420(y, u, v)
     arr = _from_yuv(y, u, v)
 
     # 7) lift crushed blacks (phones leave muddy darks, not pure 0)
-    lift = random.uniform(5.0, 9.0)
-    arr = arr + lift * np.clip(1.0 - arr / 255.0, 0.0, 1.0) ** 1.4
+    lift = random.uniform(4.0, 7.0)
+    if mean_y < 40:
+        lift += 3.0  # keep some muddy detail instead of void + snow
+    arr = arr + lift * np.clip(1.0 - arr / 255.0, 0.0, 1.0) ** 1.35
 
     # mild banding in low luma
     band = np.clip(1.0 - y / 140.0, 0.0, 1.0)[..., None]
-    levels = 56.0
+    levels = 80.0
     quantized = np.round(arr / 255.0 * levels) / levels * 255.0
-    arr = arr * (1.0 - 0.22 * band) + quantized * (0.22 * band)
+    arr = arr * (1.0 - 0.08 * band) + quantized * (0.08 * band)
 
     result = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-    result = ImageEnhance.Color(result).enhance(random.uniform(0.90, 0.98))
-    result = ImageEnhance.Contrast(result).enhance(random.uniform(0.97, 1.06))
+    result = ImageEnhance.Color(result).enhance(random.uniform(0.93, 0.99))
+    result = ImageEnhance.Contrast(result).enhance(random.uniform(0.98, 1.03))
+    # Slight mid lift on very dark frames so subject stays readable like WA night selfies
+    if mean_y < 45:
+        result = ImageEnhance.Brightness(result).enhance(1.06)
 
     # mild vignette (WhatsApp samples barely have one)
     arr = np.array(result, dtype=np.float32)
@@ -223,15 +231,15 @@ def degrade(img: Image.Image) -> Image.Image:
     result = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
 
     for i in range(passes):
-        q = jpeg_pass_q + (0 if i else 8)
+        q = jpeg_pass_q + (0 if i else 6)
         result = _jpeg_recompress(result, q)
-        # late chroma dirt after early JPEG (survives final compress better)
-        if i == 0:
+        # tiny late chroma (skip on very dark scenes — was the rainbow culprit)
+        if i == 0 and mean_y >= 40:
             a = np.array(result, dtype=np.float32)
             yy2, uu, vv = _to_yuv(a)
             sh = np.clip(1.0 - (yy2 / 255.0), 0.0, 1.0)
-            uu = uu + _blob_noise(uu.shape, 9.0, blob=5) * (0.6 + sh)
-            vv = vv + _blob_noise(vv.shape, 9.0, blob=5) * (0.6 + sh)
+            uu = uu + _blob_noise(uu.shape, 1.6, blob=14) * (0.3 + 0.3 * sh)
+            vv = vv + _blob_noise(vv.shape, 1.6, blob=14) * (0.3 + 0.3 * sh)
             a = _from_yuv(yy2, uu, vv)
             result = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
@@ -241,7 +249,7 @@ def degrade(img: Image.Image) -> Image.Image:
 
 
 def save_degraded(img: Image.Image, dest: Path) -> None:
-    q = 58
+    q = 68
     if dest.suffix.lower() in (".jpg", ".jpeg"):
         img.save(dest, format="JPEG", quality=q, optimize=False, subsampling=2)
     elif dest.suffix.lower() == ".png":
