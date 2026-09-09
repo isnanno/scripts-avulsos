@@ -1,8 +1,24 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 title Foto Realista
 cd /d "%~dp0"
-where python >nul 2>&1 || (
+
+set "PYEXE="
+rem Resolve real python.exe (PATH often missing when double-clicking .bat)
+where py >nul 2>&1 && for /f "delims=" %%I in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYEXE=%%I"
+if not defined PYEXE if exist "%LocalAppData%\Programs\Python\Python312\python.exe" set "PYEXE=%LocalAppData%\Programs\Python\Python312\python.exe"
+if not defined PYEXE if exist "%LocalAppData%\Programs\Python\Python313\python.exe" set "PYEXE=%LocalAppData%\Programs\Python\Python313\python.exe"
+if not defined PYEXE if exist "%LocalAppData%\Programs\Python\Python311\python.exe" set "PYEXE=%LocalAppData%\Programs\Python\Python311\python.exe"
+if not defined PYEXE if exist "%ProgramFiles%\Python312\python.exe" set "PYEXE=%ProgramFiles%\Python312\python.exe"
+if not defined PYEXE (
+  for /d %%D in ("%LocalAppData%\Programs\Python\Python*") do (
+    if not defined PYEXE if exist "%%~D\python.exe" set "PYEXE=%%~D\python.exe"
+  )
+)
+if not defined PYEXE where python >nul 2>&1 && for /f "delims=" %%I in ('where python') do (
+  echo %%I | find /i "WindowsApps" >nul || if not defined PYEXE set "PYEXE=%%I"
+)
+if not defined PYEXE (
   echo.
   echo   Python nao encontrado. Instale em https://python.org
   echo   Marque "Add Python to PATH" na instalacao.
@@ -10,14 +26,15 @@ where python >nul 2>&1 || (
   pause
   exit /b 1
 )
-python -c "import PIL, numpy" 2>nul || (
+
+"%PYEXE%" -c "import PIL, numpy" 2>nul || (
   echo.
   echo   Instalando dependencias ^(Pillow, numpy^)... aguarde.
   echo.
-  python -m pip install Pillow numpy
+  "%PYEXE%" -m pip install Pillow numpy
   if errorlevel 1 (
     echo.
-    echo   Falha ao instalar. Tente: python -m pip install Pillow numpy
+    echo   Falha ao instalar. Tente: "%PYEXE%" -m pip install Pillow numpy
     echo.
     pause
     exit /b 1
@@ -25,7 +42,7 @@ python -c "import PIL, numpy" 2>nul || (
 )
 set "SCRIPT=%TEMP%\foto_real_%RANDOM%.py"
 powershell -NoProfile -Command "$s=$false; Get-Content -LiteralPath '%~f0' | ForEach-Object { if ($_ -eq '#PYCODE#') { $s=$true; return }; if ($s) { $_ } } | Set-Content -LiteralPath '%SCRIPT%' -Encoding UTF8"
-python "%SCRIPT%" %*
+"%PYEXE%" "%SCRIPT%" %*
 del "%SCRIPT%" 2>nul
 if "%~1"=="" pause
 exit /b 0
