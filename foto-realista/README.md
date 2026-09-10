@@ -39,16 +39,16 @@ A versão processada sempre fica com o nome “limpo”; a original ganha `(Orig
 
 ## Prompt no Flow / Nano (edição)
 
-Por enquanto, use este prompt na edição (não diga “WhatsApp” — o modelo literaliza e inventa UI/horário):
+Prompt atual (melhor resultado até agora):
 
 ```
-Edição leve. Mesma pessoa, mesma pose, mesma mão, mesmo ângulo — não mude nada do conteúdo. Só piora a qualidade: foto de celular antigo no escuro, um pouco tremida, foco errado, pele sem filtro (poros/imperfeições), cores meio lavadas. Sem texto, sem ícones, sem relógio.
+Deixe a foto com aparência de foto real e amadora de celular, tirada no escuro para enviar no WhatsApp: iluminação irregular e fraca, pouca exposição, sombras naturais, ruído/granulação de sensor, leve desfoque de movimento e pequenas imperfeições de câmera. Remova o aspecto cinematográfico e de fotografia profissional, mantendo a imagem original.
 ```
 
-Se ainda mudar a pose:
+Se o modelo inventar interface/horário de WhatsApp, tire a menção a WhatsApp e/ou use:
 
 ```
-Não redesenhe. Não mude pose. Apenas degrade a qualidade da imagem original.
+Não redesenhe. Não mude pose. Apenas degrade a qualidade da imagem original. Sem texto, sem ícones, sem relógio.
 ```
 
 Fluxo sugerido: editar no Flow com o prompt acima → depois passar o resultado no `foto_realista.bat`.
